@@ -62,6 +62,9 @@ static QMutex mutex;
 #define AV_FREE(PKT) av_free_packet(PKT)
 #endif
 
+#define HAVE_AVCODEC_FREE_CONTEXT (LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(55, 69, 100))
+#define HAVE_CH_LAYOUT (LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100))
+
 struct FfmpegInput::Handle {
     Handle()
         : formatContext(0)
@@ -253,7 +256,11 @@ FfmpegInput::~FfmpegInput()
 {
     if (handle) {
         mutex.lock();
+        #if HAVE_AVCODEC_FREE_CONTEXT
+        avcodec_free_context(&handle->codecContext);
+        #else
         avcodec_close(handle->codecContext);
+        #endif
         #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(53, 21, 0)
         avformat_close_input(&handle->formatContext);
         #else
@@ -281,7 +288,11 @@ size_t FfmpegInput::totalFrames() const
 
 unsigned int FfmpegInput::channels() const
 {
-    return handle ? handle->codecContext->channels : 0;
+    #if HAVE_CH_LAYOUT
+        return handle ? handle->codecContext->ch_layout.nb_channels : 0;
+    #else
+        return handle ? handle->codecContext->channels : 0;
+    #endif
 }
 
 unsigned long FfmpegInput::sampleRate() const
@@ -296,57 +307,65 @@ float * FfmpegInput::buffer() const
 
 bool FfmpegInput::setChannelMap(int *st) const
 {
-    if (handle && handle->codecContext->channel_layout) {
-        unsigned int mapIndex = 0;
-        int bitCounter = 0;
-        while (mapIndex < (unsigned) handle->codecContext->channels) {
-            if (handle->codecContext->channel_layout & (1 << bitCounter)) {
-                switch (1 << bitCounter) {
-                #if LIBAVFORMAT_VERSION_MAJOR >= 54
-                case AV_CH_FRONT_LEFT:
-                #else
-                case CH_FRONT_LEFT:
-                #endif
-                    st[mapIndex] = EBUR128_LEFT;
-                    break;
-                #if LIBAVFORMAT_VERSION_MAJOR >= 54
-                case AV_CH_FRONT_RIGHT:
-                #else
-                case CH_FRONT_RIGHT:
-                #endif
-                    st[mapIndex] = EBUR128_RIGHT;
-                    break;
-                #if LIBAVFORMAT_VERSION_MAJOR >= 54
-                case AV_CH_FRONT_CENTER:
-                #else
-                case CH_FRONT_CENTER:
-                #endif
-                    st[mapIndex] = EBUR128_CENTER;
-                    break;
-                #if LIBAVFORMAT_VERSION_MAJOR >= 54
-                case AV_CH_BACK_LEFT:
-                #else
-                case CH_BACK_LEFT:
-                #endif
-                    st[mapIndex] = EBUR128_LEFT_SURROUND;
-                    break;
-                #if LIBAVFORMAT_VERSION_MAJOR >= 54
-                case AV_CH_BACK_RIGHT:
-                #else
-                case CH_BACK_RIGHT:
-                #endif
-                    st[mapIndex] = EBUR128_RIGHT_SURROUND;
-                    break;
-                default:
-                    st[mapIndex] = EBUR128_UNUSED;
-                    break;
+    #if HAVE_CH_LAYOUT
+        if (handle && handle->codecContext->ch_layout.u.mask) {
+            unsigned int mapIndex = 0;
+            int bitCounter = 0;
+            while (mapIndex < (unsigned) handle->codecContext->ch_layout.nb_channels) {
+                if (handle->codecContext->ch_layout.u.mask & (1 << bitCounter)) {
+    #else
+        if (handle && handle->codecContext->channel_layout) {
+            unsigned int mapIndex = 0;
+            int bitCounter = 0;
+            while (mapIndex < (unsigned) handle->codecContext->channels) {
+                if (handle->codecContext->channel_layout & (1 << bitCounter)) {
+    #endif
+                    switch (1 << bitCounter) {
+                        #if LIBAVFORMAT_VERSION_MAJOR >= 54
+                        case AV_CH_FRONT_LEFT:
+                            #else
+                        case CH_FRONT_LEFT:
+                            #endif
+                            st[mapIndex] = EBUR128_LEFT;
+                            break;
+                            #if LIBAVFORMAT_VERSION_MAJOR >= 54
+                        case AV_CH_FRONT_RIGHT:
+                            #else
+                        case CH_FRONT_RIGHT:
+                            #endif
+                            st[mapIndex] = EBUR128_RIGHT;
+                            break;
+                            #if LIBAVFORMAT_VERSION_MAJOR >= 54
+                        case AV_CH_FRONT_CENTER:
+                            #else
+                        case CH_FRONT_CENTER:
+                            #endif
+                            st[mapIndex] = EBUR128_CENTER;
+                            break;
+                            #if LIBAVFORMAT_VERSION_MAJOR >= 54
+                        case AV_CH_BACK_LEFT:
+                            #else
+                        case CH_BACK_LEFT:
+                            #endif
+                            st[mapIndex] = EBUR128_LEFT_SURROUND;
+                            break;
+                            #if LIBAVFORMAT_VERSION_MAJOR >= 54
+                        case AV_CH_BACK_RIGHT:
+                            #else
+                        case CH_BACK_RIGHT:
+                            #endif
+                            st[mapIndex] = EBUR128_RIGHT_SURROUND;
+                            break;
+                        default:
+                            st[mapIndex] = EBUR128_UNUSED;
+                            break;
+                    }
+                    ++mapIndex;
                 }
-                ++mapIndex;
+                ++bitCounter;
             }
-            ++bitCounter;
+            return true;
         }
-        return true;
-    }
 
     return false;
 }
@@ -470,7 +489,11 @@ free_packet:
 write_to_buffer: ;
     size_t numberRead=handle->frame->nb_samples;
     /* TODO: fix this */
-    int numChannels = handle->codecContext->channels;
+    #if HAVE_CH_LAYOUT
+        int numChannels = handle->codecContext->ch_layout.nb_channels;
+    #else
+        int numChannels = handle->codecContext->channels;
+    #endif
     // channels = handle->frame->channels;
 
     if (handle->frame->nb_samples * numChannels > (int)sizeof handle->buffer) {
@@ -571,29 +594,53 @@ static int decodeAudio(FfmpegInput::Handle *handle, int *frame_size_ptr)
     #endif
 
     ret = avcodec_decode_audio4(handle->codecContext, handle->frame, &got_frame, handle->packet);
-
-    if (ret >= 0 && got_frame) {
-        int ch, plane_size;
-        int planar = av_sample_fmt_is_planar(handle->codecContext->sample_fmt);
-        int data_size = av_samples_get_buffer_size(&plane_size, handle->codecContext->channels,
-                                                   handle->frame->nb_samples, handle->codecContext->sample_fmt, 1);
-        if (*frame_size_ptr < data_size) {
-            return AVERROR(EINVAL);
-        }
-
-        memcpy(handle->audioBuffer, handle->frame->extended_data[0], plane_size);
-
-        if (planar && handle->codecContext->channels > 1) {
-            uint8_t *out = ((uint8_t *)(handle->audioBuffer)) + plane_size;
-            for (ch = 1; ch < handle->codecContext->channels; ch++) {
-                memcpy(out, handle->frame->extended_data[ch], plane_size);
-                out += plane_size;
+    #if HAVE_CH_LAYOUT
+        if (ret >= 0 && got_frame) {
+            int ch, plane_size;
+            int planar = av_sample_fmt_is_planar(handle->codecContext->sample_fmt);
+            int data_size = av_samples_get_buffer_size(&plane_size, handle->codecContext->ch_layout.nb_channels,
+                                                    handle->frame->nb_samples, handle->codecContext->sample_fmt, 1);
+            if (*frame_size_ptr < data_size) {
+                return AVERROR(EINVAL);
             }
+
+            memcpy(handle->audioBuffer, handle->frame->extended_data[0], plane_size);
+
+            if (planar && handle->codecContext->ch_layout.nb_channels > 1) {
+                uint8_t *out = ((uint8_t *)(handle->audioBuffer)) + plane_size;
+                for (ch = 1; ch < handle->codecContext->ch_layout.nb_channels; ch++) {
+                    memcpy(out, handle->frame->extended_data[ch], plane_size);
+                    out += plane_size;
+                }
+            }
+            *frame_size_ptr = data_size;
+        } else {
+            *frame_size_ptr = 0;
         }
-        *frame_size_ptr = data_size;
-    } else {
-        *frame_size_ptr = 0;
-    }
+    #else
+        if (ret >= 0 && got_frame) {
+            int ch, plane_size;
+            int planar = av_sample_fmt_is_planar(handle->codecContext->sample_fmt);
+            int data_size = av_samples_get_buffer_size(&plane_size, handle->codecContext->channels,
+                                                    handle->frame->nb_samples, handle->codecContext->sample_fmt, 1);
+            if (*frame_size_ptr < data_size) {
+                return AVERROR(EINVAL);
+            }
+
+            memcpy(handle->audioBuffer, handle->frame->extended_data[0], plane_size);
+
+            if (planar && handle->codecContext->channels > 1) {
+                uint8_t *out = ((uint8_t *)(handle->audioBuffer)) + plane_size;
+                for (ch = 1; ch < handle->codecContext->channels; ch++) {
+                    memcpy(out, handle->frame->extended_data[ch], plane_size);
+                    out += plane_size;
+                }
+            }
+            *frame_size_ptr = data_size;
+        } else {
+            *frame_size_ptr = 0;
+        }
+    #endif
 
     return ret;
 }
@@ -635,46 +682,89 @@ size_t FfmpegInput::readOnePacket()
         AV_FREE(handle->packet);
         goto next_frame;
     }
-    switch (handle->codecContext->sample_fmt) {
-    case SAMPLE_FMT_S16: {
-        int16_t *dataShort = (int16_t*) handle->audioBuffer;
-        numberRead = (size_t) dataSize / sizeof(int16_t) / (size_t) handle->codecContext->channels;
-        for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int16_t); ++i) {
-            handle->buffer[i] = ((float) dataShort[i]) / qMax(-(float) SHRT_MIN, (float) SHRT_MAX);
+    #if HAVE_CH_LAYOUT
+        switch (handle->codecContext->sample_fmt) {
+        case SAMPLE_FMT_S16: {
+            int16_t *dataShort = (int16_t*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(int16_t) / (size_t) handle->codecContext->ch_layout.nb_channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int16_t); ++i) {
+                handle->buffer[i] = ((float) dataShort[i]) / qMax(-(float) SHRT_MIN, (float) SHRT_MAX);
+            }
+            break;
         }
-        break;
-    }
-    case SAMPLE_FMT_S32: {
-        int32_t *dataInt = (int32_t*) handle->audioBuffer;
-        numberRead = (size_t) dataSize / sizeof(int32_t) / (size_t) handle->codecContext->channels;
-        for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int32_t); ++i) {
-            handle->buffer[i] = ((float) dataInt[i]) / qMax(-(float) INT_MIN, (float) INT_MAX);
+        case SAMPLE_FMT_S32: {
+            int32_t *dataInt = (int32_t*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(int32_t) / (size_t) handle->codecContext->ch_layout.nb_channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int32_t); ++i) {
+                handle->buffer[i] = ((float) dataInt[i]) / qMax(-(float) INT_MIN, (float) INT_MAX);
+            }
+            break;
         }
-        break;
-    }
-    case SAMPLE_FMT_FLT: {
-        float *dataFloat = (float*) handle->audioBuffer;
-        numberRead = (size_t) dataSize / sizeof(float) / (size_t) handle->codecContext->channels;
-        for (unsigned int i = 0; i < (size_t) dataSize / sizeof(float); ++i) {
-            handle->buffer[i] = dataFloat[i];
+        case SAMPLE_FMT_FLT: {
+            float *dataFloat = (float*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(float) / (size_t) handle->codecContext->ch_layout.nb_channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(float); ++i) {
+                handle->buffer[i] = dataFloat[i];
+            }
+            break;
         }
-        break;
-    }
-    case SAMPLE_FMT_DBL: {
-        double *dataDouble = (double*) handle->audioBuffer;
-        numberRead = (size_t) dataSize / sizeof(double) / (size_t) handle->codecContext->channels;
-        for (unsigned int i = 0; i < (size_t) dataSize / sizeof(double); ++i) {
-            handle->buffer[i] = (float) dataDouble[i];
+        case SAMPLE_FMT_DBL: {
+            double *dataDouble = (double*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(double) / (size_t) handle->codecContext->ch_layout.nb_channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(double); ++i) {
+                handle->buffer[i] = (float) dataDouble[i];
+            }
+            break;
         }
-        break;
-    }
-    case SAMPLE_FMT_U8:
-    case SAMPLE_FMT_NONE:
-    case SAMPLE_FMT_NB:
-    default:
-        numberRead=0;
-        goto out;
-    }
+        case SAMPLE_FMT_U8:
+        case SAMPLE_FMT_NONE:
+        case SAMPLE_FMT_NB:
+        default:
+            numberRead=0;
+            goto out;
+        }
+    #else
+        switch (handle->codecContext->sample_fmt) {
+        case SAMPLE_FMT_S16: {
+            int16_t *dataShort = (int16_t*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(int16_t) / (size_t) handle->codecContext->channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int16_t); ++i) {
+                handle->buffer[i] = ((float) dataShort[i]) / qMax(-(float) SHRT_MIN, (float) SHRT_MAX);
+            }
+            break;
+        }
+        case SAMPLE_FMT_S32: {
+            int32_t *dataInt = (int32_t*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(int32_t) / (size_t) handle->codecContext->channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(int32_t); ++i) {
+                handle->buffer[i] = ((float) dataInt[i]) / qMax(-(float) INT_MIN, (float) INT_MAX);
+            }
+            break;
+        }
+        case SAMPLE_FMT_FLT: {
+            float *dataFloat = (float*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(float) / (size_t) handle->codecContext->channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(float); ++i) {
+                handle->buffer[i] = dataFloat[i];
+            }
+            break;
+        }
+        case SAMPLE_FMT_DBL: {
+            double *dataDouble = (double*) handle->audioBuffer;
+            numberRead = (size_t) dataSize / sizeof(double) / (size_t) handle->codecContext->channels;
+            for (unsigned int i = 0; i < (size_t) dataSize / sizeof(double); ++i) {
+                handle->buffer[i] = (float) dataDouble[i];
+            }
+            break;
+        }
+        case SAMPLE_FMT_U8:
+        case SAMPLE_FMT_NONE:
+        case SAMPLE_FMT_NB:
+        default:
+            numberRead=0;
+            goto out;
+        }
+    #endif
 
     out:
     AV_FREE(handle->packet);
